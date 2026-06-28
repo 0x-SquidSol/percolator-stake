@@ -21,6 +21,10 @@
 //!  16  - DepositJunior:       Deposit into junior (first-loss) tranche
 //!  18  - SetMarketResolved:   Admin marks pool as resolved (blocks deposits)
 
+/// Autonomous per-market buyback: gate parameters, failure types, the
+/// market-exposure helper, and the eligibility predicate. Pure (no engine
+/// or Solana deps); consumed by the buyback handler in `processor`.
+pub mod buyback;
 pub mod cpi;
 pub mod error;
 pub mod instruction;
