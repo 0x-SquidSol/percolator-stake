@@ -5,6 +5,8 @@ use solana_program::pubkey::Pubkey;
 pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = [0x53, 0x50, 0x4F, 0x4F, 0x4C, 0x5F, 0x56, 0x31];
 /// 8-byte discriminator for StakeDeposit accounts ("SDEP_V1\0")
 pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 0x56, 0x31, 0x00];
+/// 8-byte discriminator for BuybackState accounts ("BBST_V1\0")
+pub const BUYBACK_STATE_DISCRIMINATOR: [u8; 8] = [0x42, 0x42, 0x53, 0x54, 0x5F, 0x56, 0x31, 0x00];
 
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
@@ -603,6 +605,98 @@ impl StakePool {
     }
 }
 
+/// Number of recently-settled `round_trip_id`s retained in
+/// [`BuybackState::settled_id_ring`]. Settle attribution + replay window;
+/// sized well above the once-per-cooldown settle cadence.
+pub const SETTLED_ID_RING_LEN: usize = 16;
+
+/// Per-market buyback bookkeeping — one per stake pool.
+/// PDA seeds: [b"buyback_state", pool_pda]
+///
+/// Lazy-initialized: the first successful `trigger_buyback` pays the rent and
+/// stamps the discriminator (mirroring the `StakeDeposit` lazy-init idiom), so
+/// there is no separate admin init instruction.
+///
+/// Locker rule: this layout is frozen once it ships. Fields are never
+/// reordered, resized, or repurposed; future state lives in `_reserved` via
+/// named accessors.
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct BuybackState {
+    /// Whether this record is initialized (1 = yes, 0 = no).
+    pub is_initialized: u8,
+
+    /// Bump seed for the buyback-state PDA.
+    pub bump: u8,
+
+    /// Emergency kill switch. When 1, `trigger_buyback` is inert and
+    /// `emergency_drain_treasury` becomes callable. Set ONLY by a program
+    /// upgrade — no runtime instruction flips it (PROPOSAL.md §1: the gate has
+    /// no admin off-switch).
+    pub settle_disabled: u8,
+
+    /// Padding for 8-byte alignment of the following 64-bit fields.
+    pub _padding: [u8; 5],
+
+    /// Solana Clock `unix_timestamp` of the last successful buyback trigger.
+    /// The 24h cooldown gate is measured from here.
+    pub last_buyback_ts: i64,
+
+    /// Lifetime count of successful buyback triggers.
+    pub buyback_count: u64,
+
+    /// Collateral base units reserved for buybacks in the current 365-day
+    /// window (annual draw-cap accounting, PROPOSAL.md §5).
+    pub drain_this_year: u64,
+
+    /// Clock `unix_timestamp` when `drain_this_year` was last reset to zero.
+    pub last_year_reset_ts: i64,
+
+    /// Ring buffer of the most recently settled `round_trip_id`s — settle
+    /// attribution and replay window. The newest entry is written at
+    /// `settled_id_head`, which then advances modulo `SETTLED_ID_RING_LEN`.
+    pub settled_id_ring: [u64; SETTLED_ID_RING_LEN],
+
+    /// Next write index into `settled_id_ring`.
+    pub settled_id_head: u64,
+
+    /// Reserved. Bytes [0..8] hold the discriminator, byte [8] the version.
+    pub _reserved: [u8; 64],
+}
+
+/// Size of BuybackState in bytes.
+pub const BUYBACK_STATE_SIZE: usize = core::mem::size_of::<BuybackState>();
+
+// Compile-time lock on the frozen BuybackState layout (locker rule): any edit
+// that changes the size fails the build immediately, not only `cargo test`.
+const _: () = assert!(BUYBACK_STATE_SIZE == 240);
+
+impl BuybackState {
+    /// Current struct version. Increment when the layout changes.
+    pub const CURRENT_VERSION: u8 = 1;
+
+    /// Set the discriminator in the first 8 bytes of `_reserved` and the
+    /// version in byte 8. Call on init.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&BUYBACK_STATE_DISCRIMINATOR);
+        self._reserved[8] = Self::CURRENT_VERSION;
+    }
+
+    /// Read the struct version (byte 8 of `_reserved`). Returns 0 for
+    /// pre-versioning accounts.
+    pub fn version(&self) -> u8 {
+        self._reserved[8]
+    }
+
+    /// Validate the discriminator. Only the exact discriminator bytes pass —
+    /// a freshly-allocated (all-zero) account is rejected, mirroring the
+    /// FINDING-10 hardening on `StakePool` / `StakeDeposit`.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == BUYBACK_STATE_DISCRIMINATOR
+    }
+}
+
 /// Derive the stake pool PDA for a given slab.
 /// This PDA also becomes the wrapper admin after TransferAdmin.
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
@@ -621,6 +715,11 @@ pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> 
         &[b"stake_deposit", pool.as_ref(), user.as_ref()],
         program_id,
     )
+}
+
+/// Derive the per-pool buyback-state PDA.
+pub fn derive_buyback_state_pda(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"buyback_state", pool.as_ref()], program_id)
 }
 
 #[cfg(test)]
@@ -642,6 +741,25 @@ mod tests {
         assert_eq!(STAKE_DEPOSIT_SIZE, std::mem::size_of::<StakeDeposit>());
         // 1+1+6 + 2*32 + 2*8 + 64 = 8 + 64 + 16 + 64 = 152
         assert_eq!(STAKE_DEPOSIT_SIZE, 152);
+    }
+
+    #[test]
+    fn test_buyback_state_size() {
+        assert_eq!(BUYBACK_STATE_SIZE, std::mem::size_of::<BuybackState>());
+        // 1+1+1+5 (header) + 8+8+8+8 (ts/count/drain/reset) + 16*8 (ring)
+        //   + 8 (head) + 64 (_reserved) = 8 + 32 + 128 + 8 + 64 = 240
+        assert_eq!(BUYBACK_STATE_SIZE, 240);
+    }
+
+    #[test]
+    fn test_buyback_state_discriminator_roundtrip() {
+        // A freshly-zeroed account must NOT validate (FINDING-10 hardening),
+        // and set_discriminator must stamp both the discriminator and version.
+        let mut st = BuybackState::zeroed();
+        assert!(!st.validate_discriminator());
+        st.set_discriminator();
+        assert!(st.validate_discriminator());
+        assert_eq!(st.version(), BuybackState::CURRENT_VERSION);
     }
 
     #[test]
