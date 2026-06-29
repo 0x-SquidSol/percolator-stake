@@ -1,3 +1,4 @@
+use crate::buyback::BuybackBlocker;
 use solana_program::program_error::ProgramError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,27 @@ pub enum StakeError {
     /// #242 timelock: CommitCooldownIncrease / CancelCooldownIncrease with no active
     /// proposal (cooldown_proposed_at_slot == 0).
     NoPendingCooldownProposal = 27,
+
+    // ── Buyback gate-failure reasons (codes 28..34) ──────────────────────────
+    // One per math-crate `BuybackBlocker` variant, in the same canonical order.
+    // These are the on-chain Custom codes the keeper/SDK pin; the math crate's
+    // own `BuybackBlocker` discriminants (0..6) are NOT the wire codes, and the
+    // base is 28 here — NOT an Anchor 6000-style offset.
+    /// trigger_buyback: less than the 24h cooldown since the last trigger.
+    BuybackCooldownActive = 28,
+    /// trigger_buyback: the BuybackTreasury balance is at or below its floor.
+    BuybackBelowTreasuryFloor = 29,
+    /// trigger_buyback: the market is paying a haircut on positive PnL (stress).
+    BuybackHaircutsActive = 30,
+    /// trigger_buyback: the market is otherwise distressed and auto-paused.
+    BuybackAutoPausedUnderStress = 31,
+    /// trigger_buyback: a reserve-first staker top-up is owed/in-flight; the
+    /// buyback yields to it this slot.
+    BuybackReserveTopUpPending = 32,
+    /// trigger_buyback: the market has zero live exposure (not a real market).
+    BuybackExposureBelowMinimum = 33,
+    /// trigger_buyback: a checked_* arithmetic op failed (fail-closed bucket).
+    BuybackMathOverflow = 34,
 }
 
 impl From<StakeError> for ProgramError {
@@ -78,6 +100,36 @@ impl From<StakeError> for ProgramError {
         ProgramError::Custom(e as u32)
     }
 }
+
+/// Map a math-crate buyback gate failure to its on-chain error. Callers in the
+/// trigger handler use `.map_err(StakeError::from)?`, which surfaces as
+/// `ProgramError::Custom(28..34)` — the codes the keeper/SDK pin.
+impl From<BuybackBlocker> for StakeError {
+    fn from(b: BuybackBlocker) -> Self {
+        match b {
+            BuybackBlocker::CooldownActive => StakeError::BuybackCooldownActive,
+            BuybackBlocker::BelowTreasuryFloor => StakeError::BuybackBelowTreasuryFloor,
+            BuybackBlocker::HaircutsActive => StakeError::BuybackHaircutsActive,
+            BuybackBlocker::AutoPausedUnderStress => StakeError::BuybackAutoPausedUnderStress,
+            BuybackBlocker::ReserveTopUpPending => StakeError::BuybackReserveTopUpPending,
+            BuybackBlocker::ExposureBelowMinimum => StakeError::BuybackExposureBelowMinimum,
+            BuybackBlocker::MathOverflow => StakeError::BuybackMathOverflow,
+        }
+    }
+}
+
+// Compile-time lock on the buyback gate-failure error codes (base 28). The
+// keeper and SDK pin these Custom codes; a reorder that shifts them fails the
+// build, not only `cargo test`.
+const _: () = {
+    assert!(StakeError::BuybackCooldownActive as u32 == 28);
+    assert!(StakeError::BuybackBelowTreasuryFloor as u32 == 29);
+    assert!(StakeError::BuybackHaircutsActive as u32 == 30);
+    assert!(StakeError::BuybackAutoPausedUnderStress as u32 == 31);
+    assert!(StakeError::BuybackReserveTopUpPending as u32 == 32);
+    assert!(StakeError::BuybackExposureBelowMinimum as u32 == 33);
+    assert!(StakeError::BuybackMathOverflow as u32 == 34);
+};
 
 /// Get user-friendly hint text for an error code.
 /// Useful for off-chain clients and SDKs to provide actionable error guidance.
@@ -108,6 +160,72 @@ pub fn error_hint(code: u32) -> &'static str {
         22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
         24 => "Insurance loss outstanding — junior tranche deposits are paused until the flushed insurance is returned (total_flushed > total_returned)",
+        28 => "Buyback cooldown active — less than 24h since the last buyback trigger for this market",
+        29 => "Buyback below treasury floor — the buyback treasury is at or below its floor; nothing to spend",
+        30 => "Buyback haircuts active — the market is paying a haircut on positive PnL; buyback paused under stress",
+        31 => "Buyback auto-paused — the market is distressed; the fee accrues to the staker reserve instead",
+        32 => "Buyback reserve top-up pending — stakers are credited toward the reserve target first this slot",
+        33 => "Buyback exposure below minimum — the market has no live open interest to buy back against",
+        34 => "Buyback math overflow — a checked arithmetic operation failed in the buyback gate",
         _ => "Unknown error — check the error code and pool state",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{error_hint, StakeError};
+    use crate::buyback::BuybackBlocker;
+    use solana_program::program_error::ProgramError;
+
+    #[test]
+    fn buyback_blocker_maps_to_base_28_codes() {
+        // The keeper/SDK pin these on-chain Custom codes. Base is 28 — NOT the
+        // math crate's 0..6 BuybackBlocker discriminants, NOT an Anchor 6000 base.
+        let cases = [
+            (
+                BuybackBlocker::CooldownActive,
+                StakeError::BuybackCooldownActive,
+                28u32,
+            ),
+            (
+                BuybackBlocker::BelowTreasuryFloor,
+                StakeError::BuybackBelowTreasuryFloor,
+                29,
+            ),
+            (
+                BuybackBlocker::HaircutsActive,
+                StakeError::BuybackHaircutsActive,
+                30,
+            ),
+            (
+                BuybackBlocker::AutoPausedUnderStress,
+                StakeError::BuybackAutoPausedUnderStress,
+                31,
+            ),
+            (
+                BuybackBlocker::ReserveTopUpPending,
+                StakeError::BuybackReserveTopUpPending,
+                32,
+            ),
+            (
+                BuybackBlocker::ExposureBelowMinimum,
+                StakeError::BuybackExposureBelowMinimum,
+                33,
+            ),
+            (
+                BuybackBlocker::MathOverflow,
+                StakeError::BuybackMathOverflow,
+                34,
+            ),
+        ];
+        for (blocker, expected_err, code) in cases {
+            assert_eq!(StakeError::from(blocker), expected_err);
+            assert_eq!(expected_err as u32, code);
+            assert_eq!(ProgramError::from(expected_err), ProgramError::Custom(code));
+            assert_ne!(
+                error_hint(code),
+                "Unknown error — check the error code and pool state"
+            );
+        }
     }
 }
