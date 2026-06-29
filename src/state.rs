@@ -660,8 +660,15 @@ pub struct BuybackState {
     /// Next write index into `settled_id_ring`.
     pub settled_id_head: u64,
 
-    /// Reserved. Bytes [0..8] hold the discriminator, byte [8] the version.
-    pub _reserved: [u8; 64],
+    /// Reserved. Bytes [0..8] hold the discriminator, byte [8] the version;
+    /// bytes [9..] are headroom for the trigger -> settle handshake state
+    /// (e.g. the pending reserved slice and its reconcile anchor) added later
+    /// via named accessors, mirroring the `StakeDeposit` `_reserved` idiom.
+    /// Sized generously on purpose: this freeze commit is the only point the
+    /// layout can grow without a version bump and migration, so the headroom
+    /// is provisioned up front (StakePool's 64-byte `_reserved` ran out and
+    /// forced `pending_admin` to a top-level field — avoided here).
+    pub _reserved: [u8; 128],
 }
 
 /// Size of BuybackState in bytes.
@@ -669,7 +676,7 @@ pub const BUYBACK_STATE_SIZE: usize = core::mem::size_of::<BuybackState>();
 
 // Compile-time lock on the frozen BuybackState layout (locker rule): any edit
 // that changes the size fails the build immediately, not only `cargo test`.
-const _: () = assert!(BUYBACK_STATE_SIZE == 240);
+const _: () = assert!(BUYBACK_STATE_SIZE == 304);
 
 impl BuybackState {
     /// Current struct version. Increment when the layout changes.
@@ -747,8 +754,8 @@ mod tests {
     fn test_buyback_state_size() {
         assert_eq!(BUYBACK_STATE_SIZE, std::mem::size_of::<BuybackState>());
         // 1+1+1+5 (header) + 8+8+8+8 (ts/count/drain/reset) + 16*8 (ring)
-        //   + 8 (head) + 64 (_reserved) = 8 + 32 + 128 + 8 + 64 = 240
-        assert_eq!(BUYBACK_STATE_SIZE, 240);
+        //   + 8 (head) + 128 (_reserved) = 8 + 32 + 128 + 8 + 128 = 304
+        assert_eq!(BUYBACK_STATE_SIZE, 304);
     }
 
     #[test]
