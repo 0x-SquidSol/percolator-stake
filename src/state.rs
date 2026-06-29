@@ -7,6 +7,8 @@ pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = [0x53, 0x50, 0x4F, 0x4F, 0x4C, 0x5
 pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 0x56, 0x31, 0x00];
 /// 8-byte discriminator for BuybackState accounts ("BBST_V1\0")
 pub const BUYBACK_STATE_DISCRIMINATOR: [u8; 8] = [0x42, 0x42, 0x53, 0x54, 0x5F, 0x56, 0x31, 0x00];
+/// 8-byte discriminator for BuybackConfig accounts ("BBCF_V1\0")
+pub const BUYBACK_CONFIG_DISCRIMINATOR: [u8; 8] = [0x42, 0x42, 0x43, 0x46, 0x5F, 0x56, 0x31, 0x00];
 
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
@@ -704,6 +706,92 @@ impl BuybackState {
     }
 }
 
+/// Per-market buyback configuration — one per stake pool, written once by
+/// `BindBuybackConfig` at market launch and immutable thereafter.
+/// PDA seeds: [b"buyback_config", pool_pda]
+///
+/// The binding is the buyback's trust root: the trigger/settle handlers read
+/// the bound token/pool/pair/AMM from here instead of trusting cranker-supplied
+/// accounts. Set-once — a second bind on the same pool is rejected.
+///
+/// Locker rule: this layout is frozen once it ships.
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct BuybackConfig {
+    /// Whether this config is bound (1 = yes, 0 = no). Drives the set-once guard.
+    pub is_initialized: u8,
+
+    /// Bump seed for the buyback-config PDA.
+    pub bump: u8,
+
+    /// Padding so the pubkeys below start at offset 8, matching the
+    /// `StakeDeposit` idiom (the byte-array fields are align-1 regardless).
+    pub _padding: [u8; 6],
+
+    /// The market's bound buyback token mint — the token this market buys back.
+    /// Must differ from the market collateral mint and from `lp_mint`
+    /// (anti-reflexivity, enforced at bind and re-checked at trigger).
+    pub token_mint: [u8; 32],
+
+    /// The AMM liquidity pool the buyback deepens — NOT the stake pool PDA that
+    /// keys this config. `settle_buyback` asserts the cranker operated on this
+    /// pool.
+    pub pool: [u8; 32],
+
+    /// The Token-2022 LP receipt mint of `pool`. The cranker burns these LP
+    /// tokens to lock the liquidity; settle validates against this mint.
+    pub lp_mint: [u8; 32],
+
+    /// The pair (quote) asset mint the buyback token is paired against.
+    pub pair_mint: [u8; 32],
+
+    /// The AMM program id. Its ProgramData account is sha-pinned below.
+    pub amm_program_id: [u8; 32],
+
+    /// sha256 of the AMM's ProgramData account bytes, captured at bind time.
+    /// `settle_buyback` fail-closes if the live ProgramData hash drifts (an AMM
+    /// upgrade), per PROPOSAL.md §11 "AMM upgrade authority".
+    pub amm_program_data_sha256: [u8; 32],
+
+    /// Reserved. Bytes [0..8] hold the discriminator, byte [8] the version;
+    /// bytes [9..] are headroom for future immutable binding fields via named
+    /// accessors. 64 bytes suffices here (vs BuybackState's 128): the config is
+    /// set-once and immutable, so its evolution surface is small.
+    pub _reserved: [u8; 64],
+}
+
+/// Size of BuybackConfig in bytes.
+pub const BUYBACK_CONFIG_SIZE: usize = core::mem::size_of::<BuybackConfig>();
+
+// Compile-time lock on the frozen BuybackConfig layout (locker rule).
+const _: () = assert!(BUYBACK_CONFIG_SIZE == 264);
+
+impl BuybackConfig {
+    /// Current struct version. Increment when the layout changes.
+    pub const CURRENT_VERSION: u8 = 1;
+
+    /// Set the discriminator in the first 8 bytes of `_reserved` and the
+    /// version in byte 8. Call on bind.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&BUYBACK_CONFIG_DISCRIMINATOR);
+        self._reserved[8] = Self::CURRENT_VERSION;
+    }
+
+    /// Read the struct version (byte 8 of `_reserved`). Returns 0 for
+    /// pre-versioning accounts.
+    pub fn version(&self) -> u8 {
+        self._reserved[8]
+    }
+
+    /// Validate the discriminator. Only the exact discriminator bytes pass —
+    /// a freshly-allocated (all-zero) account is rejected, mirroring the
+    /// FINDING-10 hardening on `StakePool` / `StakeDeposit`.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == BUYBACK_CONFIG_DISCRIMINATOR
+    }
+}
+
 /// Derive the stake pool PDA for a given slab.
 /// This PDA also becomes the wrapper admin after TransferAdmin.
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
@@ -727,6 +815,17 @@ pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> 
 /// Derive the per-pool buyback-state PDA.
 pub fn derive_buyback_state_pda(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"buyback_state", pool.as_ref()], program_id)
+}
+
+/// Derive the per-pool buyback-config PDA.
+pub fn derive_buyback_config_pda(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"buyback_config", pool.as_ref()], program_id)
+}
+
+/// Derive the per-pool buyback treasury token-account PDA. Holds the market's
+/// pair/collateral mint; its SPL authority is the existing `vault_auth` PDA.
+pub fn derive_buyback_treasury_pda(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"buyback_treasury", pool.as_ref()], program_id)
 }
 
 #[cfg(test)]
@@ -767,6 +866,48 @@ mod tests {
         st.set_discriminator();
         assert!(st.validate_discriminator());
         assert_eq!(st.version(), BuybackState::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_buyback_config_size() {
+        assert_eq!(BUYBACK_CONFIG_SIZE, std::mem::size_of::<BuybackConfig>());
+        // 1+1+6 (header) + 6*32 (pubkeys) + 64 (_reserved) = 8 + 192 + 64 = 264
+        assert_eq!(BUYBACK_CONFIG_SIZE, 264);
+    }
+
+    #[test]
+    fn test_buyback_config_discriminator_roundtrip() {
+        let mut cfg = BuybackConfig::zeroed();
+        assert!(!cfg.validate_discriminator());
+        cfg.set_discriminator();
+        assert!(cfg.validate_discriminator());
+        assert_eq!(cfg.version(), BuybackConfig::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_buyback_discriminators_distinct() {
+        // Type-confusion guard: the buyback discriminators must differ from
+        // each other and from the existing account discriminators, so a loader
+        // can never accept one account type where another is expected.
+        assert_ne!(BUYBACK_STATE_DISCRIMINATOR, BUYBACK_CONFIG_DISCRIMINATOR);
+        assert_ne!(BUYBACK_STATE_DISCRIMINATOR, STAKE_POOL_DISCRIMINATOR);
+        assert_ne!(BUYBACK_STATE_DISCRIMINATOR, STAKE_DEPOSIT_DISCRIMINATOR);
+        assert_ne!(BUYBACK_CONFIG_DISCRIMINATOR, STAKE_POOL_DISCRIMINATOR);
+        assert_ne!(BUYBACK_CONFIG_DISCRIMINATOR, STAKE_DEPOSIT_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn test_buyback_pdas_distinct() {
+        // Distinct seed strings → distinct addresses for the same pool. Guards
+        // against a seed-string typo that would collide two buyback PDAs.
+        let program_id = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let state = derive_buyback_state_pda(&program_id, &pool).0;
+        let config = derive_buyback_config_pda(&program_id, &pool).0;
+        let treasury = derive_buyback_treasury_pda(&program_id, &pool).0;
+        assert_ne!(state, config);
+        assert_ne!(state, treasury);
+        assert_ne!(config, treasury);
     }
 
     #[test]
