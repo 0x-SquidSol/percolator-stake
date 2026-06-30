@@ -303,6 +303,38 @@ pub enum StakeInstruction {
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
     SetMarketResolved,
+
+    /// 24: Bind a market's immutable buyback configuration (set-once, at
+    /// launch). Writes the BuybackConfig PDA from the supplied binding and
+    /// rejects a binding where `token_mint` equals the collateral mint or the
+    /// `lp_mint` (anti-reflexivity). Accounts are defined by the handler.
+    ///
+    /// Data: token_mint(32) + pool(32) + lp_mint(32) + pair_mint(32)
+    ///   + amm_program_id(32) + amm_program_data_sha256(32) = 192 bytes.
+    BindBuybackConfig {
+        token_mint: [u8; 32],
+        pool: [u8; 32],
+        lp_mint: [u8; 32],
+        pair_mint: [u8; 32],
+        amm_program_id: [u8; 32],
+        amm_program_data_sha256: [u8; 32],
+    },
+
+    /// 25: Permissionless buyback trigger. Runs the reserve-first step and the
+    /// math gates against the BuybackTreasury, reserving a slice on success.
+    /// No instruction data.
+    TriggerBuyback,
+
+    /// 26: Permissionless settle of a completed buyback round-trip. Validates
+    /// the cranker's claim against on-chain state and emits LiquidityLocked.
+    ///
+    /// Data: round_trip_id u64 LE (8 bytes) — settle attribution only.
+    SettleBuyback { round_trip_id: u64 },
+
+    /// 27: Emergency return of a stranded reserved slice to the
+    /// BuybackTreasury. Callable only when `BuybackState.settle_disabled == 1`
+    /// (set ONLY by a program upgrade). No instruction data.
+    EmergencyDrainTreasury,
 }
 
 impl StakeInstruction {
@@ -542,6 +574,60 @@ impl StakeInstruction {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 Ok(Self::SetMarketResolved)
+            }
+            24 => {
+                if rest.len() != 192 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let token_mint: [u8; 32] = rest[0..32]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let pool: [u8; 32] = rest[32..64]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let lp_mint: [u8; 32] = rest[64..96]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let pair_mint: [u8; 32] = rest[96..128]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let amm_program_id: [u8; 32] = rest[128..160]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let amm_program_data_sha256: [u8; 32] = rest[160..192]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                Ok(Self::BindBuybackConfig {
+                    token_mint,
+                    pool,
+                    lp_mint,
+                    pair_mint,
+                    amm_program_id,
+                    amm_program_data_sha256,
+                })
+            }
+            25 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::TriggerBuyback)
+            }
+            26 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let round_trip_id = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::SettleBuyback { round_trip_id })
+            }
+            27 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::EmergencyDrainTreasury)
             }
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -897,5 +983,85 @@ mod tests {
             ),
             "tag 23 with trailing bytes must reject"
         );
+    }
+
+    #[test]
+    fn test_unpack_bind_buyback_config() {
+        // Six distinct 32-byte fields, in declaration order, after the tag.
+        let mut data = vec![24u8];
+        for f in 0u8..6 {
+            data.extend(std::iter::repeat(f + 1).take(32));
+        }
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::BindBuybackConfig {
+                token_mint,
+                pool,
+                lp_mint,
+                pair_mint,
+                amm_program_id,
+                amm_program_data_sha256,
+            } => {
+                assert_eq!(token_mint, [1u8; 32]);
+                assert_eq!(pool, [2u8; 32]);
+                assert_eq!(lp_mint, [3u8; 32]);
+                assert_eq!(pair_mint, [4u8; 32]);
+                assert_eq!(amm_program_id, [5u8; 32]);
+                assert_eq!(amm_program_data_sha256, [6u8; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Tag 24 must reject any payload that is not exactly 192 bytes.
+    #[test]
+    fn test_unpack_bind_buyback_config_wrong_length_rejected() {
+        for len in [0usize, 160, 191, 193] {
+            let mut data = vec![24u8];
+            data.extend(std::iter::repeat(0u8).take(len));
+            assert!(
+                StakeInstruction::unpack(&data).is_err(),
+                "tag 24 with {} payload bytes must Err",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn test_unpack_trigger_buyback() {
+        assert!(matches!(
+            StakeInstruction::unpack(&[25u8]).unwrap(),
+            StakeInstruction::TriggerBuyback
+        ));
+        // Trailing bytes rejected (tag-only instruction).
+        assert!(StakeInstruction::unpack(&[25u8, 0u8]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_settle_buyback() {
+        let mut data = vec![26u8];
+        data.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::SettleBuyback { round_trip_id } => {
+                assert_eq!(round_trip_id, 0x0102_0304_0506_0708);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // 7-byte payload (short) rejected.
+        assert!(StakeInstruction::unpack(&[26u8, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        // 9-byte payload (trailing) rejected.
+        let mut long = vec![26u8];
+        long.extend_from_slice(&1u64.to_le_bytes());
+        long.push(99u8);
+        assert!(StakeInstruction::unpack(&long).is_err());
+    }
+
+    #[test]
+    fn test_unpack_emergency_drain_treasury() {
+        assert!(matches!(
+            StakeInstruction::unpack(&[27u8]).unwrap(),
+            StakeInstruction::EmergencyDrainTreasury
+        ));
+        // Trailing bytes rejected (tag-only instruction).
+        assert!(StakeInstruction::unpack(&[27u8, 0u8]).is_err());
     }
 }

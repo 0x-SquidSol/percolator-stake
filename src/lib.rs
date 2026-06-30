@@ -20,6 +20,10 @@
 //!  15  - AdminSetTrancheConfig: Configure senior/junior tranches
 //!  16  - DepositJunior:       Deposit into junior (first-loss) tranche
 //!  18  - SetMarketResolved:   Admin marks pool as resolved (blocks deposits)
+//!  24  - BindBuybackConfig:   Bind a market's immutable buyback configuration
+//!  25  - TriggerBuyback:      Permissionless buyback trigger (gate + reserve slice)
+//!  26  - SettleBuyback:       Permissionless settle of a completed round-trip
+//!  27  - EmergencyDrainTreasury: Return a stranded slice (settle_disabled only)
 
 /// Autonomous per-market buyback: gate parameters, failure types, the
 /// market-exposure helper, and the eligibility predicate. Pure (no engine

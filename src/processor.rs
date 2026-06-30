@@ -403,6 +403,17 @@ pub fn process(
             process_deposit_junior(program_id, accounts, amount)
         }
         StakeInstruction::SetMarketResolved => process_set_market_resolved(program_id, accounts),
+        // Buyback instructions (24-27): decoded and dispatched here. Each handler
+        // is wired in a following commit; until then a call is rejected rather
+        // than silently succeeding. Variants are peeled out of this arm one at a
+        // time as their handlers land.
+        StakeInstruction::BindBuybackConfig { .. }
+        | StakeInstruction::TriggerBuyback
+        | StakeInstruction::SettleBuyback { .. }
+        | StakeInstruction::EmergencyDrainTreasury => {
+            msg!("buyback instruction received but its handler is not yet wired");
+            Err(ProgramError::InvalidInstructionData)
+        }
     }
 }
 
