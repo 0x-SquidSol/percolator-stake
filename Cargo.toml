@@ -16,6 +16,13 @@ pinocchio-token = "0.5.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 # Pin blake3 to avoid edition2024 (SBF platform-tools has Rust 1.84)
 blake3 = ">=1.5.0, <1.8.0"
+# v16 risk engine — read-only market views (MarketGroupV16View / V16Config) for
+# the buyback gate, so the gate reads exposure/haircut through the engine's own
+# surface and cannot diverge from the matcher. Leaf crate: bytemuck / no_std,
+# NO solana dependency, so no version conflict (unlike percolator-prog, which
+# pulls solana 1.18). fork-facade exposes the view types + group_haircut_active().
+# Path dep for fork development; retarget to dcccrypto/percolator at transfer.
+percolator = { path = "../percolator", features = ["fork-facade"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
