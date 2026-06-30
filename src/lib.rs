@@ -27,6 +27,7 @@
 pub mod buyback;
 pub mod cpi;
 pub mod error;
+pub mod event;
 pub mod instruction;
 pub mod math;
 pub mod processor;
