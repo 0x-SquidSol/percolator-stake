@@ -284,7 +284,8 @@ use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
 use crate::state::{
-    self, derive_vault_authority, StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
+    self, derive_buyback_config_pda, derive_vault_authority, BuybackConfig, StakeDeposit,
+    StakePool, BUYBACK_CONFIG_SIZE, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -407,8 +408,24 @@ pub fn process(
         // is wired in a following commit; until then a call is rejected rather
         // than silently succeeding. Variants are peeled out of this arm one at a
         // time as their handlers land.
-        StakeInstruction::BindBuybackConfig { .. }
-        | StakeInstruction::TriggerBuyback
+        StakeInstruction::BindBuybackConfig {
+            token_mint,
+            pool,
+            lp_mint,
+            pair_mint,
+            amm_program_id,
+            amm_program_data_sha256,
+        } => process_bind_buyback_config(
+            program_id,
+            accounts,
+            token_mint,
+            pool,
+            lp_mint,
+            pair_mint,
+            amm_program_id,
+            amm_program_data_sha256,
+        ),
+        StakeInstruction::TriggerBuyback
         | StakeInstruction::SettleBuyback { .. }
         | StakeInstruction::EmergencyDrainTreasury => {
             msg!("buyback instruction received but its handler is not yet wired");
@@ -3335,10 +3352,148 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 24: BindBuybackConfig — admin binds a market's immutable buyback config
+// ═══════════════════════════════════════════════════════════════
+
+/// Length-checked, alignment-safe reinterpretation of a BuybackConfig account
+/// (mirrors `pool_from_data_mut`).
+fn buyback_config_from_data_mut(data: &mut [u8]) -> Result<&mut BuybackConfig, ProgramError> {
+    if data.len() < BUYBACK_CONFIG_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes_mut::<BuybackConfig>(&mut data[..BUYBACK_CONFIG_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+/// Bind a market's immutable buyback configuration. Admin-gated and set-once.
+///
+/// Accounts:
+///   0. `[signer]`   Admin (the pool admin; pays the config PDA rent)
+///   1. `[]`         Pool PDA (read admin + collateral_mint; validated)
+///   2. `[writable]` BuybackConfig PDA (`[b"buyback_config", pool]`) — created here
+///   3. `[]`         System program
+///
+/// The supplied `amm_program_data_sha256` is the admin's captured pin; it is
+/// stored as-is and enforced at settle (the settle handler recomputes the live
+/// AMM program-data hash and fail-closes on drift). A wrong pin is a
+/// self-inflicted, recoverable DoS (a stranded slice returns via
+/// `emergency_drain_treasury`), never a fund risk.
+#[allow(clippy::too_many_arguments)]
+fn process_bind_buyback_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    token_mint: [u8; 32],
+    pool: [u8; 32],
+    lp_mint: [u8; 32],
+    pair_mint: [u8; 32],
+    amm_program_id: [u8; 32],
+    amm_program_data_sha256: [u8; 32],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let admin = next_account_info(account_info_iter)?;
+    let pool_pda = next_account_info(account_info_iter)?;
+    let config_pda = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    // Admin must sign.
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate the pool and authorize the caller against its admin. The pool's
+    // collateral_mint feeds the anti-reflexivity guard below.
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    let collateral_mint = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool_state = pool_from_data(&pool_data[..])?;
+        if pool_state.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool_state.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool_state)?;
+        if pool_state.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        pool_state.collateral_mint
+    };
+
+    // Anti-reflexivity: a market must never buy its own collateral or its LP.
+    if token_mint == collateral_mint {
+        msg!("Error: buyback token_mint must differ from the market collateral mint");
+        return Err(StakeError::InvalidMint.into());
+    }
+    if token_mint == lp_mint {
+        msg!("Error: buyback token_mint must differ from the pool lp_mint");
+        return Err(StakeError::InvalidMint.into());
+    }
+
+    // Derive + verify the config PDA, keyed on the pool PDA.
+    let (expected_config, config_bump) = derive_buyback_config_pda(program_id, pool_pda.key);
+    if *config_pda.key != expected_config {
+        return Err(StakeError::InvalidPda.into());
+    }
+    validate_account_writable(config_pda)?;
+
+    // Set-once: a config PDA has no private key, so only this program can ever
+    // write data there, and it does so only on a successful bind. Any non-empty
+    // account is therefore already bound. A System-squatted address holds
+    // lamports but zero data, so it falls through and is adopted below.
+    if !config_pda.data_is_empty() {
+        msg!("Error: buyback config already bound for this pool (set-once)");
+        return Err(StakeError::AlreadyInitialized.into());
+    }
+
+    // Create the config PDA (squat-resistant), admin as payer.
+    let config_seeds: &[&[u8]] = &[b"buyback_config", pool_pda.key.as_ref(), &[config_bump]];
+    create_or_adopt_pda(
+        config_pda,
+        admin,
+        system_program,
+        program_id,
+        BUYBACK_CONFIG_SIZE,
+        config_seeds,
+    )?;
+
+    // Write the immutable binding; set the discriminator last.
+    let mut cfg_data = config_pda.try_borrow_mut_data()?;
+    let cfg = buyback_config_from_data_mut(&mut cfg_data[..])?;
+    cfg.is_initialized = 1;
+    cfg.bump = config_bump;
+    cfg.token_mint = token_mint;
+    cfg.pool = pool;
+    cfg.lp_mint = lp_mint;
+    cfg.pair_mint = pair_mint;
+    cfg.amm_program_id = amm_program_id;
+    cfg.amm_program_data_sha256 = amm_program_data_sha256;
+    cfg.set_discriminator();
+
+    msg!("BindBuybackConfig: bound for pool {}", pool_pda.key);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn bind_buyback_config_is_dispatched_to_its_handler() {
+        // Tag 24 with a valid 192-byte binding but no accounts: dispatch must
+        // route to process_bind_buyback_config, which errors at the first
+        // next_account_info (NotEnoughAccountKeys) — proving the handler is
+        // wired, not the not-yet-implemented stub (InvalidInstructionData).
+        let program_id = Pubkey::new_unique();
+        let mut data = vec![24u8];
+        data.extend(std::iter::repeat(7u8).take(192));
+        assert_eq!(
+            process(&program_id, &[], &data),
+            Err(ProgramError::NotEnoughAccountKeys),
+        );
+    }
 
     // ── #242 timelock_window_elapsed (pure helper) ──────────────────────────
     #[test]
