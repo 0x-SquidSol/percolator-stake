@@ -704,6 +704,41 @@ impl BuybackState {
         let disc = &self._reserved[..8];
         disc == BUYBACK_STATE_DISCRIMINATOR
     }
+
+    // ── trigger -> settle handshake (carved from `_reserved`) ───────────────
+    // Byte map of `_reserved` (after [0..8] discriminator, [8] version):
+    //   [9..17]  pending_slice            (u64 LE)
+    //   [17..25] treasury_balance_before  (u64 LE)
+    //   [25..]   free (reserve-first bookkeeping, future handshake fields)
+    // Named accessors so any future layout change surfaces at compile time
+    // rather than silently corrupting the handshake (the StakeDeposit idiom).
+
+    /// The slice the last successful trigger reserved for the round-trip,
+    /// awaiting settle (collateral base units). Zero when no round-trip is in
+    /// flight.
+    pub fn pending_slice(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[9..17]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the pending reserved slice.
+    pub fn set_pending_slice(&mut self, val: u64) {
+        self._reserved[9..17].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// The `BuybackTreasury` balance captured at the last trigger — settle's
+    /// reconcile anchor (collateral base units).
+    pub fn treasury_balance_before(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[17..25]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the trigger-time treasury balance.
+    pub fn set_treasury_balance_before(&mut self, val: u64) {
+        self._reserved[17..25].copy_from_slice(&val.to_le_bytes());
+    }
 }
 
 /// Per-market buyback configuration — one per stake pool, written once by
@@ -864,6 +899,20 @@ mod tests {
         let mut st = BuybackState::zeroed();
         assert!(!st.validate_discriminator());
         st.set_discriminator();
+        assert!(st.validate_discriminator());
+        assert_eq!(st.version(), BuybackState::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_buyback_state_handshake_accessors() {
+        let mut st = BuybackState::zeroed();
+        st.set_discriminator();
+        st.set_pending_slice(123_456);
+        st.set_treasury_balance_before(987_654_321);
+        assert_eq!(st.pending_slice(), 123_456);
+        assert_eq!(st.treasury_balance_before(), 987_654_321);
+        // The handshake fields live past the discriminator/version, so writing
+        // them must not disturb either.
         assert!(st.validate_discriminator());
         assert_eq!(st.version(), BuybackState::CURRENT_VERSION);
     }
