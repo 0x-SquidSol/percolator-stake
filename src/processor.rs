@@ -284,9 +284,11 @@ use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
 use crate::state::{
-    self, derive_buyback_config_pda, derive_vault_authority, BuybackConfig, StakeDeposit,
-    StakePool, BUYBACK_CONFIG_SIZE, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
+    self, derive_buyback_config_pda, derive_buyback_state_pda, derive_buyback_treasury_pda,
+    derive_vault_authority, BuybackConfig, BuybackState, StakeDeposit, StakePool,
+    BUYBACK_CONFIG_SIZE, BUYBACK_STATE_SIZE, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
 };
+use percolator::{Market, MarketGroupV16HeaderAccount, MarketGroupV16View};
 
 // ─────────────────────────────────────────────────────────────────────────
 // #199: length-checked bytemuck reinterpretation helpers.
@@ -425,9 +427,8 @@ pub fn process(
             amm_program_id,
             amm_program_data_sha256,
         ),
-        StakeInstruction::TriggerBuyback
-        | StakeInstruction::SettleBuyback { .. }
-        | StakeInstruction::EmergencyDrainTreasury => {
+        StakeInstruction::TriggerBuyback => process_trigger_buyback(program_id, accounts),
+        StakeInstruction::SettleBuyback { .. } | StakeInstruction::EmergencyDrainTreasury => {
             msg!("buyback instruction received but its handler is not yet wired");
             Err(ProgramError::InvalidInstructionData)
         }
@@ -3475,6 +3476,309 @@ fn process_bind_buyback_config(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 25: TriggerBuyback — permissionless gate + slice reservation
+// ═══════════════════════════════════════════════════════════════
+
+/// The wrapper's per-market oracle-storage size (percolator-prog
+/// `ASSET_ORACLE_WRAPPER_LEN`). Stake carves the market account's slots as
+/// `Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>`, layout-identical to the wrapper's
+/// `Market<AssetOracleStorageV16>` because that type is `[u8; 512]`. This is the
+/// one coupling to the wrapper's layout, and it is FAIL-CLOSED: the engine's
+/// `validate_dynamic_market_group_account_len` runs before any typed read, so if
+/// the wrapper ever changes this size the account length stops matching and
+/// trigger_buyback REJECTS rather than misreading exposure — this constant must
+/// then be bumped in lockstep.
+const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
+type WrapperSlot = [u8; ASSET_ORACLE_WRAPPER_LEN];
+
+/// Hardcoded floor below which the BuybackTreasury does not fire — keeps a
+/// near-empty treasury from churning dust round-trips (PROPOSAL.md §2.3 / §4). A
+/// gate constant, not an admin tunable; changing it requires a program upgrade.
+/// Collateral base units (1.0 at 6 decimals).
+const BUYBACK_TREASURY_FLOOR: u64 = 1_000_000;
+
+/// 365 days in seconds — the annual draw-cap window reset (PROPOSAL.md §5).
+const YEAR_SECS: i64 = 31_536_000;
+
+/// Length-checked, alignment-safe reinterpretation of a BuybackState account.
+fn buyback_state_from_data_mut(data: &mut [u8]) -> Result<&mut BuybackState, ProgramError> {
+    if data.len() < BUYBACK_STATE_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes_mut::<BuybackState>(&mut data[..BUYBACK_STATE_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn buyback_state_from_data(data: &[u8]) -> Result<&BuybackState, ProgramError> {
+    if data.len() < BUYBACK_STATE_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes::<BuybackState>(&data[..BUYBACK_STATE_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn buyback_config_from_data(data: &[u8]) -> Result<&BuybackConfig, ProgramError> {
+    if data.len() < BUYBACK_CONFIG_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes::<BuybackConfig>(&data[..BUYBACK_CONFIG_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+/// Read the buyback gate's market inputs from the cranker-supplied market
+/// account — the SECURITY-CRITICAL read: trigger_buyback is permissionless, so
+/// this account's exposure/haircut decide whether a treasury slice is reserved.
+/// Validation runs strictly BEFORE any typed read:
+///
+///   1. Identity: `market.key == expected_slab` AND `market.owner ==
+///      expected_owner` (the pool's bound, wrapper-owned market). A cranker
+///      cannot substitute a crafted account.
+///   2. Fail-closed length: the engine's own
+///      `validate_dynamic_market_group_account_len::<WrapperSlot>` confirms the
+///      account is exactly a `Market<[u8;512]>` group; a mismatch rejects.
+///
+/// Only then is the typed `MarketGroupV16View` built and asset slot 0 (the
+/// single-market / asset-0 convention the rest of the program uses) read. The
+/// exposure inputs and the haircut come through the engine's own
+/// fields/accessor, so the gate cannot diverge from the matcher.
+fn read_market_gate_inputs(
+    market: &AccountInfo,
+    expected_slab: &[u8; 32],
+    expected_owner: &[u8; 32],
+) -> Result<(crate::buyback::MarketView, bool), ProgramError> {
+    // (1) Identity — the trust root for everything below.
+    if market.key.to_bytes() != *expected_slab {
+        msg!("Error: trigger market account is not the pool's bound slab");
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if market.owner.to_bytes() != *expected_owner {
+        msg!("Error: trigger market account is not owned by the wrapper program");
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let data = market.try_borrow_data()?;
+    let header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();
+    if data.len() < header_len {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    // Read the fixed-size header (length-safe, identity-verified) for the
+    // declared slot capacity.
+    let header = bytemuck::try_from_bytes::<MarketGroupV16HeaderAccount>(&data[..header_len])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let capacity = header.asset_slot_capacity.get() as usize;
+
+    // (2) Fail-closed length validation BEFORE building the markets view: a
+    // WrapperSlot-size mismatch makes the declared capacity fail to reconcile
+    // with the account length, and this rejects.
+    MarketGroupV16HeaderAccount::validate_dynamic_market_group_account_len::<WrapperSlot>(
+        data.len(),
+        capacity,
+    )
+    .map_err(|_| StakeError::InvalidAccount)?;
+    if capacity == 0 {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let markets = bytemuck::try_cast_slice::<u8, Market<WrapperSlot>>(&data[header_len..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let view = MarketGroupV16View::new(header, markets);
+
+    // Asset slot 0 — the single market this pool manages (asset-0 convention).
+    let asset = &view
+        .markets
+        .first()
+        .ok_or(StakeError::InvalidAccount)?
+        .engine
+        .asset;
+    let market_view = crate::buyback::MarketView {
+        oi_eff_long_q: asset.oi_eff_long_q.get(),
+        oi_eff_short_q: asset.oi_eff_short_q.get(),
+        // effective_price is the matcher's current mark (spec.md: notional =
+        // pos_q * oracle_price / POS_SCALE). Its absolute scale only affects the
+        // observability event and the non-zero-exposure precondition (which keys
+        // on liveness), never the slice (bps of treasury).
+        oracle_price_e6: asset.effective_price.get() as u128,
+        maintenance_bps: view.header.config.maintenance_margin_bps.get(),
+    };
+
+    // Haircut: the matcher's exact group determination (header-only).
+    let haircut_active = view.group_haircut_active();
+
+    Ok((market_view, haircut_active))
+}
+
+/// Read an SPL token account's `amount`, validating the bound treasury PDA and
+/// SPL ownership.
+fn read_treasury_balance(
+    treasury: &AccountInfo,
+    expected_treasury: &Pubkey,
+) -> Result<u64, ProgramError> {
+    if *treasury.key != *expected_treasury {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if *treasury.owner != crate::spl_token::id() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    let data = treasury.try_borrow_data()?;
+    Ok(crate::spl_token::state::Account::unpack(&data)?.amount)
+}
+
+/// Permissionless buyback trigger: gate the market against the treasury and, on
+/// a non-zero slice, reserve it and stamp the cooldown.
+///
+/// Accounts:
+///   0. `[]`         Pool PDA (slab / percolator_program / collateral_mint)
+///   1. `[]`         Market account (the bound slab; validated; exposure+haircut)
+///   2. `[]`         BuybackConfig PDA (the binding; anti-reflexivity re-check)
+///   3. `[writable]` BuybackState PDA (lazy-init + stamp)
+///   4. `[]`         BuybackTreasury token account (balance)
+///   5. `[signer]`   Cranker (fee payer; pays state rent on the first trigger)
+///   6. `[]`         System program (lazy-init)
+///
+/// Reserve-first staker top-up and the BuybackTriggered event are added in the
+/// following commits.
+fn process_trigger_buyback(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let pool_pda = next_account_info(account_info_iter)?;
+    let market = next_account_info(account_info_iter)?;
+    let config_pda = next_account_info(account_info_iter)?;
+    let state_pda = next_account_info(account_info_iter)?;
+    let treasury = next_account_info(account_info_iter)?;
+    let cranker = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    // Permissionless: any signer may crank — the gate, not an allowlist, decides
+    // whether it fires. The cranker pays the first-trigger state rent.
+    if !cranker.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate the pool and copy the fields the gate needs.
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    let (slab, percolator_program, collateral_mint) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool = pool_from_data(&pool_data[..])?;
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        (pool.slab, pool.percolator_program, pool.collateral_mint)
+    };
+
+    // Resolve the market's binding (its existence == bound) and re-check
+    // anti-reflexivity at trigger (defense in depth vs. bind).
+    let (expected_config, _) = derive_buyback_config_pda(program_id, pool_pda.key);
+    if *config_pda.key != expected_config {
+        return Err(StakeError::InvalidPda.into());
+    }
+    validate_account_owner(config_pda, program_id)?;
+    validate_account_not_empty(config_pda)?;
+    let token_mint = {
+        let cfg_data = config_pda.try_borrow_data()?;
+        let cfg = buyback_config_from_data(&cfg_data[..])?;
+        if cfg.is_initialized != 1 || !cfg.validate_discriminator() {
+            return Err(StakeError::NotInitialized.into());
+        }
+        cfg.token_mint
+    };
+    if token_mint == collateral_mint {
+        msg!("Error: buyback token_mint equals the market collateral mint");
+        return Err(StakeError::InvalidMint.into());
+    }
+
+    // Validated market gate inputs + treasury balance.
+    let (market_view, haircut_active) =
+        read_market_gate_inputs(market, &slab, &percolator_program)?;
+    let (expected_treasury, _) = derive_buyback_treasury_pda(program_id, pool_pda.key);
+    let treasury_balance = read_treasury_balance(treasury, &expected_treasury)?;
+
+    // Clock from syscall — never an account (a forgeable timestamp would bypass
+    // the cooldown gate).
+    let now = Clock::get()?.unix_timestamp;
+
+    // Verify + lazy-init the BuybackState PDA (the first trigger pays its rent).
+    let (expected_state, state_bump) = derive_buyback_state_pda(program_id, pool_pda.key);
+    if *state_pda.key != expected_state {
+        return Err(StakeError::InvalidPda.into());
+    }
+    validate_account_writable(state_pda)?;
+    if state_pda.data_is_empty() {
+        let state_seeds: &[&[u8]] = &[b"buyback_state", pool_pda.key.as_ref(), &[state_bump]];
+        create_or_adopt_pda(
+            state_pda,
+            cranker,
+            system_program,
+            program_id,
+            BUYBACK_STATE_SIZE,
+            state_seeds,
+        )?;
+        let mut sdata = state_pda.try_borrow_mut_data()?;
+        let st = buyback_state_from_data_mut(&mut sdata[..])?;
+        st.is_initialized = 1;
+        st.bump = state_bump;
+        st.set_discriminator();
+    } else {
+        validate_account_owner(state_pda, program_id)?;
+    }
+
+    // The cooldown anchor comes from state (0 on a fresh PDA -> first trigger
+    // always clears the 24h cooldown).
+    let last_buyback_ts = {
+        let sdata = state_pda.try_borrow_data()?;
+        buyback_state_from_data(&sdata[..])?.last_buyback_ts
+    };
+
+    // Run the gate. Exposure feeds the non-zero precondition; the slice is bps
+    // of treasury.
+    let exposure = crate::buyback::market_exposure(market_view).map_err(StakeError::from)?;
+    let slice = crate::buyback::buyback_eligible(
+        treasury_balance,
+        exposure,
+        last_buyback_ts,
+        now,
+        haircut_active,
+        BUYBACK_TREASURY_FLOOR,
+    )
+    .map_err(StakeError::from)?;
+
+    // Ok(0) is a no-stamp contract: no point burning a 24h cooldown slot on a
+    // zero-byte event (PROPOSAL.md §5.1).
+    if slice == 0 {
+        msg!("trigger_buyback: zero slice — not stamping the cooldown");
+        return Ok(());
+    }
+
+    // Reserve the slice and stamp. The annual draw-cap window resets after 365
+    // days.
+    let mut sdata = state_pda.try_borrow_mut_data()?;
+    let st = buyback_state_from_data_mut(&mut sdata[..])?;
+    if st.is_initialized != 1 || !st.validate_discriminator() {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if now.saturating_sub(st.last_year_reset_ts) >= YEAR_SECS {
+        st.drain_this_year = 0;
+        st.last_year_reset_ts = now;
+    }
+    st.set_pending_slice(slice);
+    st.set_treasury_balance_before(treasury_balance);
+    st.last_buyback_ts = now;
+    st.buyback_count = st.buyback_count.saturating_add(1);
+    st.drain_this_year = st.drain_this_year.saturating_add(slice);
+
+    msg!(
+        "trigger_buyback: reserved slice {} for pool {}",
+        slice,
+        pool_pda.key
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3491,6 +3795,18 @@ mod tests {
         data.extend(std::iter::repeat(7u8).take(192));
         assert_eq!(
             process(&program_id, &[], &data),
+            Err(ProgramError::NotEnoughAccountKeys),
+        );
+    }
+
+    #[test]
+    fn trigger_buyback_is_dispatched_to_its_handler() {
+        // Tag 25 (no payload), no accounts: dispatch routes to
+        // process_trigger_buyback, which errors at the first next_account_info
+        // (NotEnoughAccountKeys) — proving the handler is wired, not the stub.
+        let program_id = Pubkey::new_unique();
+        assert_eq!(
+            process(&program_id, &[], &[25u8]),
             Err(ProgramError::NotEnoughAccountKeys),
         );
     }
