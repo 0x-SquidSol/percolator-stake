@@ -111,6 +111,24 @@ pub struct StakePool {
 
     /// Reserved for future use
     pub _reserved: [u8; 64],
+
+    /// #242 cooldown-increase timelock: the pending (larger) `cooldown_slots` awaiting
+    /// commit. Dedicated struct field (v3, offset 384), NOT carved from `_reserved`.
+    ///
+    /// This value previously lived in `_reserved[10..18]`, which collided with the
+    /// PERC-313 HWM fields (`hwm_enabled`/`hwm_floor_bps`/`epoch_high_water_tvl` occupy
+    /// `_reserved[10..24]`): proposing a cooldown increase corrupted HWM and an HWM
+    /// refresh corrupted a pending proposal. `_reserved` has no free 16-byte run, so the
+    /// two timelock values were promoted to real fields (appended after `_reserved` so no
+    /// existing offset shifts). Growing STAKE_POOL_SIZE 384 -> 400 is why CURRENT_VERSION
+    /// bumps 2 -> 3. Fresh-start cutover: no prior pools exist, so no migration is needed.
+    /// Meaningful only while `cooldown_proposed_at_slot() != 0`.
+    pub cooldown_pending_slots: u64,
+
+    /// #242 cooldown-increase timelock: the slot at which the pending increase was
+    /// proposed. `0` = no active proposal (the sentinel; a live mainnet slot is never 0).
+    /// Dedicated struct field (v3, offset 392). See [`cooldown_pending_slots`].
+    pub cooldown_proposal_slot: u64,
 }
 
 /// Size of StakePool in bytes
@@ -336,34 +354,30 @@ impl StakePool {
         self._reserved[59] = if burned { 1 } else { 0 };
     }
 
-    /// #242 timelock: the `cooldown_slots` INCREASE awaiting commit. Stored at
-    /// `_reserved[10..18]` (LE u64), in the previously-free `[10..32]` region — no
-    /// struct-size change, no version bump. Meaningful only while
-    /// `cooldown_proposed_at_slot() != 0`.
+    /// #242 timelock: the `cooldown_slots` INCREASE awaiting commit. Backed by the
+    /// dedicated `cooldown_pending_slots` field (v3) — previously stored in
+    /// `_reserved[10..18]`, which collided with the PERC-313 HWM fields. Meaningful only
+    /// while `cooldown_proposed_at_slot() != 0`.
     pub fn pending_cooldown_slots(&self) -> u64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self._reserved[10..18]);
-        u64::from_le_bytes(bytes)
+        self.cooldown_pending_slots
     }
 
     /// Set the pending cooldown-increase value. See [`pending_cooldown_slots`].
     pub fn set_pending_cooldown_slots(&mut self, val: u64) {
-        self._reserved[10..18].copy_from_slice(&val.to_le_bytes());
+        self.cooldown_pending_slots = val;
     }
 
     /// #242 timelock: the slot at which the pending cooldown increase was proposed.
-    /// `0` = no active proposal (the sentinel; a live mainnet slot is never 0). Stored
-    /// at `_reserved[18..26]` (LE u64).
+    /// `0` = no active proposal (the sentinel; a live mainnet slot is never 0). Backed by
+    /// the dedicated `cooldown_proposal_slot` field (v3) — previously `_reserved[18..26]`.
     pub fn cooldown_proposed_at_slot(&self) -> u64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self._reserved[18..26]);
-        u64::from_le_bytes(bytes)
+        self.cooldown_proposal_slot
     }
 
     /// Set the cooldown-increase proposal slot (`0` clears the proposal). See
     /// [`cooldown_proposed_at_slot`].
     pub fn set_cooldown_proposed_at_slot(&mut self, val: u64) {
-        self._reserved[18..26].copy_from_slice(&val.to_le_bytes());
+        self.cooldown_proposal_slot = val;
     }
 
     /// Loss-adjusted junior tranche balance.
@@ -412,7 +426,10 @@ impl StakePool {
 
     /// Current struct version. Increment when layout changes.
     /// v2 (size 352 -> 384): added `pending_admin` for two-step admin rotation.
-    pub const CURRENT_VERSION: u8 = 2;
+    /// v3 (size 384 -> 400): promoted the #242 cooldown-increase timelock values to
+    /// dedicated `cooldown_pending_slots` / `cooldown_proposal_slot` fields, resolving the
+    /// `_reserved` byte collision with the PERC-313 HWM fields.
+    pub const CURRENT_VERSION: u8 = 3;
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
     /// Call on init.
@@ -631,10 +648,11 @@ mod tests {
     fn test_stake_pool_size() {
         // Ensure struct is packed correctly (no surprise padding)
         assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
-        // v2 size: prior 352 + pending_admin[32] = 384.
+        // v3 size: prior 384 + cooldown_pending_slots(u64) + cooldown_proposal_slot(u64) = 400.
         // 1+1+1+1+4 + 5*32 + 7*8 + 32(percolator_program) + 24(PERC-272 u64s)
-        //   + 1(pool_mode) + 7(mode_pad) + 32(pending_admin) + 64(_reserved) = 384
-        assert_eq!(STAKE_POOL_SIZE, 384);
+        //   + 1(pool_mode) + 7(mode_pad) + 32(pending_admin) + 64(_reserved)
+        //   + 8(cooldown_pending_slots) + 8(cooldown_proposal_slot) = 400
+        assert_eq!(STAKE_POOL_SIZE, 400);
     }
 
     #[test]

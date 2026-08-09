@@ -101,8 +101,9 @@ const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 /// UpdateConfig tx and lock LP withdrawals. That increase is now IMPLEMENTED as a
 /// two-phase timelock — ProposeCooldownIncrease (tag 7) records the pending value and
 /// proposal slot in StakePool (`pending_cooldown_slots` / `cooldown_proposed_at_slot`,
-/// stored in the previously-free `_reserved[10..26]` — no struct-size change / version
-/// bump), and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
+/// backed by the dedicated v3 `cooldown_pending_slots` / `cooldown_proposal_slot` fields —
+/// they previously aliased `_reserved[10..26]`, which collided with the PERC-313 HWM
+/// fields), and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
 /// elapsed, giving LP holders a guaranteed ≥48h exit window. CancelCooldownIncrease
 /// (tag 9) withdraws a pending proposal. UpdateConfig now REJECTS a cooldown increase
 /// (`CooldownIncreaseRequiresTimelock`); decreases (LP-friendly) and `deposit_cap`
@@ -605,6 +606,9 @@ fn process_init_pool(
     pool.last_vault_snapshot = 0;
     pool.pool_mode = 0; // InitTradingPool overrides to 1 after this call
     pool.pending_admin = [0u8; 32];
+    // v3 #242 timelock fields: no active cooldown proposal at genesis.
+    pool.cooldown_pending_slots = 0;
+    pool.cooldown_proposal_slot = 0;
     pool.set_discriminator();
 
     msg!(
@@ -3382,13 +3386,21 @@ mod tests {
 
     #[test]
     fn pending_cooldown_bytes_do_not_collide_with_neighbors() {
-        // _reserved[10..26] must not disturb the discriminator/version[0..9],
-        // market_resolved[9], tranche[32+], or realized_junior_loss[51..59].
+        // The #242 timelock values live in dedicated v3 fields (cooldown_pending_slots /
+        // cooldown_proposal_slot), so writing them must not disturb the discriminator/
+        // version[0..9], market_resolved[9], the PERC-313 HWM fields ([10..32]), the
+        // tranche state ([32+]), or realized_junior_loss[51..59].
         let mut pool = StakePool::zeroed();
         pool.set_discriminator();
         pool.set_market_resolved(true);
         pool.set_realized_junior_loss(7_777);
         pool.set_tranche_enabled(true);
+        // Seed HWM state, then write the timelock values, then confirm HWM is intact —
+        // this is the regression guard for the _reserved collision the v3 fields resolved.
+        pool.set_hwm_enabled(true);
+        pool.set_hwm_floor_bps(5_000);
+        pool.set_epoch_high_water_tvl(1_000_000);
+        pool.set_hwm_last_epoch(42);
         pool.set_pending_cooldown_slots(u64::MAX);
         pool.set_cooldown_proposed_at_slot(123);
         assert!(pool.validate_discriminator());
@@ -3396,6 +3408,11 @@ mod tests {
         assert!(pool.market_resolved());
         assert!(pool.tranche_enabled());
         assert_eq!(pool.realized_junior_loss(), 7_777);
+        // HWM state survives the timelock writes (no byte collision).
+        assert!(pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 5_000);
+        assert_eq!(pool.epoch_high_water_tvl(), 1_000_000);
+        assert_eq!(pool.hwm_last_epoch(), 42);
         assert_eq!(pool.pending_cooldown_slots(), u64::MAX);
         assert_eq!(pool.cooldown_proposed_at_slot(), 123);
     }
