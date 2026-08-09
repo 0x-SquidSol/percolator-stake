@@ -3060,13 +3060,15 @@ fn process_return_insurance(
         return Err(ProgramError::IllegalOwner);
     }
 
-    // M-1: physical outstanding = (flushed - returned) + realized_junior_loss.
-    // realized_junior_loss was added to total_returned as a bookkeeping settlement
-    // when the last junior exited; adding it back exposes the full physical recovery
-    // capacity that senior holders are entitled to.
-    let outstanding = pool.total_flushed
-        .saturating_sub(pool.total_returned)
-        .saturating_add(pool.realized_junior_loss());
+    // Returnable capacity is the UNSETTLED loss only (total_flushed - total_returned),
+    // via the shared StakePool::insurance_recoverable() so this path and
+    // RecoverFlushedInsurance can never diverge. It deliberately EXCLUDES
+    // realized_junior_loss: the last-junior-exit settlement already booked
+    // `total_returned += L` (phantom) for the forfeited portion, and adding it back here
+    // would let `total_returned += amount` double-count it — pushing total_returned above
+    // total_flushed and windfalling the forfeited junior capital to senior (#161). See the
+    // helper doc for the full rationale.
+    let outstanding = pool.insurance_recoverable();
     if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",
@@ -3207,9 +3209,11 @@ fn process_recover_flushed_insurance(
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // CAP: amount must not exceed outstanding = total_flushed - total_returned.
-    // Use saturating_sub so a stale / already-fully-returned pool yields 0 outstanding.
-    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    // CAP: amount must not exceed the unsettled flushed loss. Shared with ReturnInsurance
+    // via StakePool::insurance_recoverable() (total_flushed - total_returned, excluding the
+    // already-settled realized_junior_loss). saturating_sub keeps a stale / fully-returned
+    // pool at 0 outstanding.
+    let outstanding = pool.insurance_recoverable();
     if outstanding == 0 {
         msg!(
             "RecoverFlushedInsurance: nothing to recover (total_flushed={} total_returned={})",

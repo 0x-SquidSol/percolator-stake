@@ -306,12 +306,16 @@ impl StakePool {
     ///
     /// When the LAST junior LP exits while a loss is outstanding, the loss it absorbed
     /// (`junior_balance − effective_junior_balance`) is forfeited: the junior took its
-    /// marked-down payout and walked away, so a later `ReturnInsurance` of that portion
-    /// must NOT flow to senior (which was protected). We settle that portion at exit
-    /// (`total_returned += L`) so it leaves the recoverable-loss ledger, and record it
-    /// here so `total_pool_value()` subtracts it — the recovered tokens then sit as DEAD
-    /// (unclaimable) value rather than windfalling senior. Conservation: vault tokens ==
-    /// junior_claims + senior_claims + realized_junior_loss(dead).
+    /// marked-down payout and walked away, so that portion must NOT flow to senior (which
+    /// was protected). We settle it at exit (`total_returned += L`, a phantom booking with
+    /// no token movement) so it leaves the recoverable-loss ledger, and record the same L
+    /// here so `total_pool_value()` subtracts it — netting the phantom `+L` to zero and
+    /// leaving senior at its principal. The forfeited tokens remain in the wrapper
+    /// insurance fund and are NOT returnable to the vault: both `ReturnInsurance` and
+    /// `RecoverFlushedInsurance` cap returns at `total_flushed − total_returned`, which the
+    /// phantom settlement has already driven to exclude this portion. Conservation: vault
+    /// tokens == junior_claims + senior_claims; the forfeited realized_junior_loss stays in
+    /// the insurance fund, unclaimable by any tranche.
     pub fn realized_junior_loss(&self) -> u64 {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&self._reserved[51..59]);
@@ -321,6 +325,23 @@ impl StakePool {
     /// Set the cumulative realized (forfeited) junior loss. See `realized_junior_loss`.
     pub fn set_realized_junior_loss(&mut self, val: u64) {
         self._reserved[51..59].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Insurance tokens still recoverable to the pool vault: the unsettled flushed loss,
+    /// `total_flushed − total_returned`.
+    ///
+    /// This is the single source of truth for BOTH the `ReturnInsurance` and
+    /// `RecoverFlushedInsurance` returnable caps, so the two paths can never diverge.
+    /// It deliberately EXCLUDES `realized_junior_loss`: the last-junior-exit settlement
+    /// already books `total_returned += L` (a phantom, no-token-movement settlement) for
+    /// the forfeited junior portion, which this subtraction removes from the returnable
+    /// capacity. Adding `realized_junior_loss` back would re-expose that dead portion; a
+    /// subsequent `total_returned += amount` (with no `realized_junior_loss` decrement)
+    /// would double-count `total_returned` — pushing it above `total_flushed` and
+    /// windfalling the forfeited junior capital to the protected senior tranche (#161).
+    /// `saturating_sub` keeps this panic-free if `total_returned` ever leads.
+    pub fn insurance_recoverable(&self) -> u64 {
+        self.total_flushed.saturating_sub(self.total_returned)
     }
 
     /// Whether BurnAssetAdmin has completed for this pool's market.
