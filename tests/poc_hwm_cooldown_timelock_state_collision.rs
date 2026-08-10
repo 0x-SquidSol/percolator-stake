@@ -23,7 +23,9 @@
 //!
 //! This is the same class of defect the codebase previously flagged CRITICAL for the
 //! byte-9 `market_resolved`/`hwm_enabled` collision. This test asserts the independence
-//! invariant using the program's real accessors; it fails on current code.
+//! invariant using the program's real accessors; it fails on the pre-fix layout that
+//! packed both features into `_reserved` — revert the dedicated fields and it goes red
+//! again.
 
 use bytemuck::Zeroable;
 use percolator_stake::state::StakePool;
